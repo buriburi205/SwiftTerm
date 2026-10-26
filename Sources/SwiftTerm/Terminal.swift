@@ -8378,6 +8378,20 @@ open class Terminal {
         refresh (startRow: 0, endRow: self.rows - 1)
     }
 
+    /// Clears the normal screen and history except for the cursor's logical line.
+    /// Preserves the cursor column, parser state and terminal input modes.
+    /// Returns false on the alternate screen. Call while holding `terminalLock`.
+    @discardableResult
+    public func clearScreenPreservingCurrentLine() -> Bool {
+        guard !isCurrentBufferAlternate else { return false }
+        endSynchronizedOutput()
+        clearKittyImages(in: normalBuffer, isAlternateBuffer: false)
+        normalBuffer.clearScreenPreservingCurrentLine()
+        userScrolling = false
+        refresh(startRow: 0, endRow: rows - 1)
+        return true
+    }
+
     public func changeScrollback (_ newScrollback: Int?)
     {
         // Only the normal buffer has scrollback, the alt buffer should never have scrollback.

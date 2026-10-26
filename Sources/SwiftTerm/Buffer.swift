@@ -1057,6 +1057,31 @@ public final class Buffer {
         savedY = max (savedY - amountToTrim, 0)
     }
 
+    /// Keeps the logical line containing the cursor, including its wrapped rows.
+    /// Line objects are retained so packed cells, links and semantic marks survive.
+    func clearScreenPreservingCurrentLine() {
+        let cursorRow = yBase + y
+        let savedRow = yBase + savedY
+        var first = cursorRow
+        while first > 0 && lines[first].isWrapped { first -= 1 }
+        var last = cursorRow
+        while last + 1 < lines.count && lines[last + 1].isWrapped { last += 1 }
+        let retained = (first...last).map { lines[$0] }
+        let newCursorRow = cursorRow - first
+
+        lines.reset(maxLength: lines.maxLength)
+        for line in retained { lines.push(line) }
+        lines[0].isWrapped = false
+        while lines.count < rows { lines.push(getBlankLine(attribute: CharData.defaultAttr)) }
+        recalculateLinesWithImagesCount()
+        linesTop += first
+        yBase = min(newCursorRow, max(0, retained.count - rows))
+        y = newCursorRow - yBase
+        yDisp = yBase
+        savedY = max(0, min(savedRow - first - yBase, rows - 1))
+        if semanticPromptStartRow == nil { clearSemanticPromptGroup() }
+    }
+
     public func changeHistorySize (_ newScrollback: Int?)
     {
         self.scrollback = newScrollback

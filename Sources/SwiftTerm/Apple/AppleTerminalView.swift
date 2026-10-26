@@ -4686,6 +4686,29 @@ extension TerminalView {
         frameDriver.markDirty()
     }
     
+    /// Clears the screen and history while preserving the current logical line.
+    /// The operation is local and does nothing on the alternate screen.
+    @discardableResult
+    public func clearScreenPreservingCurrentLine() -> Bool {
+        let changed = withTerminal { terminal in
+            guard !terminal.isCurrentBufferAlternate else { return false }
+            selection?.selectNone()
+            search?.reset()
+            terminal.clearScreenPreservingCurrentLine()
+            userScrolling = false
+            return true
+        }
+        guard changed else { return false }
+#if os(iOS) || os(visionOS)
+        resetManualScrollOffsetWithinRow()
+#endif
+        updateScroller()
+        terminalDelegate?.scrolled(source: self, position: scrollPosition)
+        setAccessibilityNotificationForNextFrame(true)
+        frameDriver.markDirty()
+        return true
+    }
+
     /**
      * Sends the specified slice of byte arrays to the program running under the terminal emulator
      * - Parameter data: the slice of an array to send to the client
