@@ -527,6 +527,7 @@ final class SnapshotTextBuilder {
 
             let isSelected = isColumnSelected(selectionColumns, column: col, width: width)
             let blinkHidden = !context.textBlinkVisible && attr.style.contains(.blink)
+            let contentHidden = attr.style.contains(.invisible) || blinkHidden
 
             let text: String
             let character: Character
@@ -547,7 +548,7 @@ final class SnapshotTextBuilder {
             // Host glyph fallback: cells the custom Powerline/box/block
             // renderers will consume below keep those dedicated paths.
             var glyphFallback: (font: TTFont, policy: TerminalGlyphPlacementPolicy)? = nil
-            if context.glyphFallbackProvider != nil, !blinkHidden,
+            if context.glyphFallbackProvider != nil, !contentHidden,
                !PowerlineRenderer.shouldRender(codePoint: renderCodePoint,
                                               customGlyphsEnabled: context.customBlockGlyphs),
                !(context.customBlockGlyphs
@@ -575,7 +576,7 @@ final class SnapshotTextBuilder {
                 lastUsesShapeColor = usesShapeColor
                 lastGlyphFallbackFont = glyphFallback?.font
                 lastGlyphFallbackPolicy = glyphFallback?.policy
-                if isSelected || blinkHidden || usesShapeColor || glyphFallback != nil {
+                if isSelected || contentHidden || usesShapeColor || glyphFallback != nil {
                     var batchAttributes = attributes.values
                     if usesShapeColor {
                         batchAttributes[.foregroundColor] = shapeColor(of: attributes, context: context)
@@ -591,8 +592,9 @@ final class SnapshotTextBuilder {
                             batchAttributes[.strikethroughColor] = context.selectedTextForegroundColor
                         }
                     }
-                    if blinkHidden {
+                    if contentHidden {
                         batchAttributes[.foregroundColor] = TTColor.clear
+                        batchAttributes[SwiftTermShapeColorKey] = TTColor.clear
                         batchAttributes.removeValue(forKey: .underlineColor)
                         batchAttributes.removeValue(forKey: .underlineStyle)
                         batchAttributes.removeValue(forKey: .strikethroughColor)
@@ -612,7 +614,7 @@ final class SnapshotTextBuilder {
 
             // Render Powerline separators independently of the font so their
             // joining edge shares the background's exact pixel boundary.
-            if !blinkHidden && PowerlineRenderer.shouldRender(codePoint: renderCodePoint,
+            if !contentHidden && PowerlineRenderer.shouldRender(codePoint: renderCodePoint,
                                               customGlyphsEnabled: context.customBlockGlyphs) {
                 flushPending()
                 let fgColor = shapeColor(of: currentAttributes, context: context)
@@ -626,7 +628,7 @@ final class SnapshotTextBuilder {
                 previousPlaceholderAttribute = nil
             // Renders box drawing characters independently of the font
             // U+2500...U+257F
-            } else if !blinkHidden, context.customBlockGlyphs,
+            } else if !contentHidden, context.customBlockGlyphs,
                renderCodePoint >= UInt32(BoxDrawingRenderer.lowerBoundary),
                renderCodePoint <= UInt32(BoxDrawingRenderer.upperBoundary) {
                 flushPending()
@@ -640,7 +642,7 @@ final class SnapshotTextBuilder {
                 previousPlaceholderAttribute = nil
             // Renders block elements independently of the font
             // U+2580...U+259F
-            } else if !blinkHidden, context.customBlockGlyphs,
+            } else if !contentHidden, context.customBlockGlyphs,
                       (renderCodePoint >= UInt32(BlockElementMapping.lowerBoundary)
                        && renderCodePoint <= UInt32(BlockElementMapping.upperBoundary)),
                       let rects = BlockElementMapping.rects(for: renderCodePoint) {
@@ -661,11 +663,11 @@ final class SnapshotTextBuilder {
                                                                        previous: previousPlaceholder,
                                                                        previousAttribute: previousPlaceholderAttribute) {
                 flushPending()
-                kittyPlaceholders.append(placeholder)
+                if !attr.style.contains(.invisible) { kittyPlaceholders.append(placeholder) }
                 builder?.append(text: " ", attributes: currentAttributes, cellUTF16Lengths: [1])
                 previousPlaceholder = placeholder
                 previousPlaceholderAttribute = attr
-            } else if !blinkHidden && bidiLayout != nil &&
+            } else if !contentHidden && bidiLayout != nil &&
                       TerminalBidi.needsCellIsolation(
                         character, scalarCount: text.unicodeScalars.count) {
                 // In BiDi rows, Arabic-script cells and cells holding combining
@@ -696,10 +698,10 @@ final class SnapshotTextBuilder {
                 previousPlaceholderAttribute = nil
             } else {
                 // Common path: just accumulate into the batch
-                let renderedText = blinkHidden ? " " : text
+                let renderedText = contentHidden ? " " : text
                 pendingText.append(contentsOf: renderedText)
                 var cellUTF16Length = renderedText.utf16.count
-                if !blinkHidden && glyphFallback == nil
+                if !contentHidden && glyphFallback == nil
                     && UnicodeUtil.prefersTextPresentation(character) {
                     // Steer font fallback away from Apple Color Emoji for
                     // default-text-presentation symbols (see prefersTextPresentation).
@@ -777,7 +779,8 @@ final class SnapshotTextBuilder {
                                              cell: cell, context: context)
             let isSelected = isColumnSelected(selectionColumns, column: col, width: 1)
             let blinkHidden = !context.textBlinkVisible && attribute.style.contains(.blink)
-            codes.append(blinkHidden || code == 0 ? 0x20 : UInt8(code))
+            let contentHidden = attribute.style.contains(.invisible) || blinkHidden
+            codes.append(contentHidden || code == 0 ? 0x20 : UInt8(code))
             if let last = runs.indices.last, styleKey == lastStyleKey, hasUrl == lastHasUrl,
                isSelected == lastIsSelected, blinkHidden == lastBlinkHidden {
                 runs[last].end = col + 1
@@ -798,8 +801,9 @@ final class SnapshotTextBuilder {
                     style.strikethrough = .color(context.selectedTextForegroundColor)
                 }
             }
-            if blinkHidden {
+            if contentHidden {
                 style.foreground = .color(TTColor.clear)
+                style.shapeColor = .color(TTColor.clear)
                 style.underline = nil
                 style.strikethrough = nil
             }
