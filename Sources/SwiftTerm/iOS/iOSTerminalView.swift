@@ -222,6 +222,33 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         }
     }
 
+    /// 로컬 선택 모드에서는 첫 드래그부터 텍스트를 선택하고 원격 포인터 입력을 차단한다.
+    /// 두 손가락과 휠은 로컬 스크롤을 유지하며, 해제하면 기존 마우스 보고 정책으로 복귀한다.
+    public var isSelectingText: Bool = false {
+        didSet {
+            guard isSelectingText != oldValue, terminal != nil else { return }
+            stopSelectionTimer()
+            panStart = nil
+            if !isSelectingText {
+                withTerminal { _ in selection.selectNone() }
+                disableSelectionPanGesture()
+            }
+            refreshProgramScrollGesture()
+        }
+    }
+
+    private var reportsMouse: Bool { allowMouseReporting && !isSelectingText }
+    private var editMenuStorage: (any UIInteraction)?
+    @available(iOS 16.0, *)
+    private var editMenu: UIEditMenuInteraction {
+        if let menu = editMenuStorage as? UIEditMenuInteraction { return menu }
+        let menu = UIEditMenuInteraction(delegate: self)
+        editMenuStorage = menu
+        addInteraction(menu)
+        return menu
+    }
+    private var editMenuIsVisible = false
+
     /// Controls how link tracking resolves hovered links:
     /// `.explicit` = OSC 8 only, `.implicit` = explicit + implicit fallback, `.none` = off.
     public var linkReporting: LinkReporting = .implicit
@@ -782,6 +809,14 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     ///  - pos: the location where this was triggered in the buffer, it used at a later point
     ///  to auto-select a word
     func showContextMenu (forRegion: CGRect, pos: Position) {
+        if #available(iOS 16.0, *) {
+            lastLongSelect = pos
+            lastLongSelectRegion = forRegion
+            editMenu.presentEditMenu(with: UIEditMenuConfiguration(
+                identifier: nil, sourcePoint: CGPoint(x: forRegion.midX, y: forRegion.midY)))
+            return
+        }
+        // iOS 14·15의 기존 편집 메뉴 경로는 유지한다.
         let items: [UIMenuItem] = []
         
         lastLongSelect = pos
@@ -822,6 +857,25 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     
     @objc func longPress (_ gestureRecognizer: UILongPressGestureRecognizer)
     {
+        if isSelectingText {
+            let point = gestureRecognizer.location(in: self)
+            switch gestureRecognizer.state {
+            case .began:
+                _ = becomeFirstResponder()
+                beginLocalSelection(at: point)
+            case .changed:
+                extendLocalSelection(to: point)
+            case .ended:
+                extendLocalSelection(to: point)
+                showContextMenu(forRegion: makeContextMenuRegionForSelection(),
+                                pos: calculateTapHit(point: point).grid)
+            case .cancelled, .failed:
+                withTerminal { _ in selection.selectNone() }
+            default:
+                break
+            }
+            return
+        }
          if gestureRecognizer.state == .began {
              let _ = self.becomeFirstResponder()
              let tapLocation = gestureRecognizer.location(in: gestureRecognizer.view)
@@ -957,7 +1011,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     @discardableResult
     public func forwardTap(at point: CGPoint) -> Bool {
         let routing = withTerminal { terminal in
-            (press: allowMouseReporting && terminal.mouseMode.sendButtonPress(),
+            (press: reportsMouse && terminal.mouseMode.sendButtonPress(),
              release: terminal.mouseMode.sendButtonRelease())
         }
         guard routing.press else { return false }
@@ -1006,7 +1060,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     private func tapAction(tapCount: Int,
                            gestureRecognizer: UIGestureRecognizer) -> TerminalTapAction {
         withTerminal { terminal in
-            let mouseReportingActive = allowMouseReporting &&
+            let mouseReportingActive = reportsMouse &&
                 !shiftBypassesMouseReportingLocked(for: gestureRecognizer) &&
                 terminal.mouseMode.sendButtonPress()
             return TerminalTapPolicy.action(tapCount: tapCount,
@@ -1021,6 +1075,15 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
               gestureRecognizer.state == .ended else { return }
 
         let tapHit = calculateTapHit(gesture: gestureRecognizer).grid
+        if isSelectingText {
+            _ = becomeFirstResponder()
+            withTerminal { terminal in
+                selection.selectWordOrExpression(at: tapHit, in: terminal.displayBuffer)
+                selection.selectionMode = .character
+            }
+            showContextMenu(forRegion: makeContextMenuRegionForSelection(), pos: tapHit)
+            return
+        }
         if let result = linkForClick(at: tapHit, hasCommandModifier: commandActive) {
             terminalDelegate?.requestOpenLink(source: self, link: result.link, params: result.params)
             return
@@ -1066,7 +1129,9 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
                 return (hadSelection, snapshot, Position(col: buffer.x, row: buffer.y + buffer.yBase))
             }
             if state.hadSelection { disableSelectionPanGesture() }
-            if UIMenuController.shared.isMenuVisible {
+            if editMenuIsVisible {
+                if #available(iOS 16.0, *) { editMenu.dismissMenu() }
+            } else if UIMenuController.shared.isMenuVisible {
                 UIMenuController.shared.hideMenu()
             } else {
                 let location = gestureRecognizer.location(in: gestureRecognizer.view)
@@ -1100,7 +1165,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         // A single tap belongs to an unfocused tracking application. Reserve a deliberate double
         // tap as the way to bring the software keyboard back.
         if !isFirstResponder,
-           allowMouseReporting,
+           reportsMouse,
            withTerminal({ $0.mouseMode.sendButtonPress() }) {
             _ = becomeFirstResponder()
             return
@@ -1220,7 +1285,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     /// alternate buffer that does not track the mouse, Alternate Scroll Mode turns the same drag
     /// into cursor keys. Two fingers remain available for local scrollback.
     @objc func panMouseHandler (_ gestureRecognizer: UIPanGestureRecognizer) {
-        guard gestureRecognizer.view != nil, allowMouseReporting else { return }
+        guard gestureRecognizer.view != nil, reportsMouse else { return }
         switch gestureRecognizer.state {
         case .began:
             wheelDragAccumulator.reset()
@@ -1270,7 +1335,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         // Keep routing, coordinate conversion, and reports in one terminal operation.
         let cursorLines = withTerminal { terminal -> Int in
             let route = ProgramScrollRouting.route(
-                allowMouseReporting: allowMouseReporting,
+                allowMouseReporting: reportsMouse,
                 shiftBypassesMouseReporting:
                     modifiers.contains(.shift) && !terminal.mouseShiftCapture,
                 mouseTracking: terminal.mouseMode != .off,
@@ -1356,7 +1421,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         return withTerminal { terminal in
             !shiftBypassesMouseReportingLocked(for: gestureRecognizer) &&
                 ProgramScrollRouting.capturesGesture(
-                    allowMouseReporting: allowMouseReporting,
+                    allowMouseReporting: reportsMouse,
                     mouseTracking: terminal.mouseMode != .off,
                     alternateBuffer: terminal.isDisplayBufferAlternate)
         }
@@ -1381,6 +1446,26 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     var panStart: Position?
     var panTask: Task<(),Never>?
     
+    // 셀 좌표와 BiDi 변환은 렌더러와 같은 잠금 경계에서 처리한다.
+    func beginLocalSelection(at point: CGPoint) {
+        guard isSelectingText else { return }
+        if #available(iOS 16.0, *) { editMenu.dismissMenu() }
+        withTerminal { _ in
+            let hit = calculateTapHitLocked(point: point).grid
+            selection.setSoftStart(bufferPosition: hit)
+            selection.startSelection()
+            selection.pivot = hit
+        }
+    }
+
+    func extendLocalSelection(to point: CGPoint) {
+        guard isSelectingText else { return }
+        withTerminal { _ in
+            selection.pivotExtend(bufferPosition: calculateTapHitLocked(point: point).grid)
+        }
+        requestDisplay()
+    }
+
     @objc func panSelectionHandler (_ gestureRecognizer: UIPanGestureRecognizer) {
         func near (_ pos1: Position, _ pos2: Position) -> Bool {
             return abs (pos1.col-pos2.col) < 3 && abs (pos1.row-pos2.row) < 2
@@ -1411,6 +1496,12 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
                 break
             }
             panStart = hit
+            if isSelectingText {
+                let location = gestureRecognizer.location(in: self)
+                let translation = gestureRecognizer.translation(in: self)
+                beginLocalSelection(at: CGPoint(x: location.x - translation.x, y: location.y - translation.y))
+                extendLocalSelection(to: location)
+            }
         case .changed:
             let absoluteY = gestureRecognizer.location (in: self).y - contentOffset.y
             let hit = calculateTapHit(gesture: gestureRecognizer).grid
@@ -1426,9 +1517,9 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
                 }
                 requestDisplay()
             } else {
-                if let ps = panStart {
+                if !isSelectingText, let ps = panStart {
                     let deltaRow = ps.row - hit.row
-                    if allowMouseReporting {
+                    if reportsMouse {
                         // TODO: what scenario would have this?
                         scrollDown (lines: deltaRow)
                     } else {
@@ -1444,9 +1535,10 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
                 showContextMenu (forRegion: makeContextMenuRegionForSelection(), pos: calculateTapHit(gesture: gestureRecognizer).grid)
             }
             break
-        case .cancelled:
+        case .cancelled, .failed:
             stopSelectionTimer()
-            withTerminal { _ in selection.active = false }
+            panStart = nil
+            withTerminal { _ in selection.selectNone() }
         default:
             break
         }
@@ -1479,11 +1571,13 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             return
         }
         let gesture = UIPanGestureRecognizer (target: self, action: #selector(panSelectionHandler))
+        gesture.maximumNumberOfTouches = 1
         addGestureRecognizer(gesture)
         self.panSelectionGesture = gesture
     }
     
     func disableSelectionPanGesture() {
+        guard !isSelectingText else { return }
         guard let gesture = panSelectionGesture else {
             return
         }
@@ -1572,7 +1666,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
 
     /// Hover has no pressed button. Only Any Event Tracking (1003) requests these reports.
     func forwardPointerHover(at point: CGPoint, modifiers: UIKeyModifierFlags) {
-        guard allowMouseReporting, bounds.contains(point) else { return }
+        guard reportsMouse, bounds.contains(point) else { return }
         withTerminal { terminal in
             guard terminal.mouseMode.sendMotionEvent(),
                   !modifiers.contains(.shift) || terminal.mouseShiftCapture else { return }
@@ -3745,6 +3839,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             self.invalidateTerminalContents()
 
             if !self.withTerminal({ _ in self.selection.active }) {
+                if #available(iOS 16.0, *) { self.editMenu.dismissMenu() }
                 UIMenuController.shared.hideMenu()
                 self.withTerminal { _ in self.selection.selectNone() }
                 self.disableSelectionPanGesture()
@@ -3776,17 +3871,22 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         pointerScrollAccumulator.reset()
         let capturesProgramScroll = withTerminal { terminal in
             ProgramScrollRouting.capturesGesture(
-                allowMouseReporting: allowMouseReporting,
+                allowMouseReporting: reportsMouse,
                 mouseTracking: (mouseMode ?? terminal.mouseMode) != .off,
                 alternateBuffer: terminal.isDisplayBufferAlternate)
         }
-        if capturesProgramScroll {
+        if isSelectingText {
+            disableMousePanGesture()
+            enableSelectionPanGesture()
+            panGestureRecognizer.minimumNumberOfTouches = 2
+        } else if capturesProgramScroll {
             enableMousePanGesture()
         } else {
             disableMousePanGesture()
+            panGestureRecognizer.minimumNumberOfTouches = 1
         }
     }
-    
+
     nonisolated open func setTerminalTitle(source: Terminal, title: String) {
         let capturedTitle = title
         onMain { [weak self] in
@@ -4223,3 +4323,22 @@ extension TerminalView: UIAccessibilityReadingContent {
 #endif
 
 #endif // !SWIFTTERM_EMBEDDED
+
+#if !SWIFTTERM_EMBEDDED && (os(iOS) || os(visionOS))
+@available(iOS 16.0, *)
+extension TerminalView: @MainActor UIEditMenuInteractionDelegate {
+    /// 표준 편집 메뉴가 표시되는 동안의 상태를 기록한다.
+    public func editMenuInteraction(_ interaction: UIEditMenuInteraction,
+                                    willPresentMenuFor configuration: UIEditMenuConfiguration,
+                                    animator: any UIEditMenuInteractionAnimating) {
+        editMenuIsVisible = true
+    }
+
+    /// 표준 편집 메뉴가 닫히면 표시 상태를 해제한다.
+    public func editMenuInteraction(_ interaction: UIEditMenuInteraction,
+                                    willDismissMenuFor configuration: UIEditMenuConfiguration,
+                                    animator: any UIEditMenuInteractionAnimating) {
+        editMenuIsVisible = false
+    }
+}
+#endif
