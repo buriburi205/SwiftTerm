@@ -845,6 +845,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     }
     
     /// This controls whether the backspace should send ^? or ^H, the default is ^?
+    /// The backspace key also sends ^H while the application sets DECBKM (`CSI ? 67 h`).
     public var backspaceSendsControlH: Bool = false
 
     /// If this variable is set, this simulates the control key being pressed, it auto resets after we send data
@@ -2547,12 +2548,13 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     }
     private func kittyEncoder() -> KittyKeyboardEncoder {
         let terminalState = withTerminal { terminal in
-            (terminal.keyboardEnhancementFlags, terminal.applicationCursor, terminal.applicationKeypad)
+            (terminal.keyboardEnhancementFlags, terminal.applicationCursor, terminal.applicationKeypad,
+             terminal.backarrowKeyMode)
         }
         return KittyKeyboardEncoder(flags: terminalState.0,
                                     applicationCursor: terminalState.1,
                                     applicationKeypad: terminalState.2,
-                                    backspaceSendsControlH: backspaceSendsControlH)
+                                    backspaceSendsControlH: backspaceSendsControlH || terminalState.3)
     }
 
     private func kittyModifiers(from key: UIKey, includeOption: Bool) -> KittyKeyboardModifiers {
@@ -2929,7 +2931,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     private func sendBackspaceKey() {
         let flags = withTerminal { $0.keyboardEnhancementFlags }
         if flags.isEmpty {
-            send([backspaceSendsControlH ? 8 : 0x7f])
+            send([backspaceKeySendsControlH ? 8 : 0x7f])
             return
         }
         let pendingEvent = pendingKittyKeyEvent
@@ -3651,15 +3653,9 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     }
     
     nonisolated open func cursorStyleChanged (source: Terminal, newStyle: CursorStyle) {
-        let style = newStyle
-        onMain { [weak self] in
-            guard let self else { return }
-            self.caretView?.style = style
-            self.updateCaretView()
-#if canImport(MetalKit)
-            self.frameDriver.markDirty()
-#endif
-        }
+        // Applied by applyPendingViewUpdates at the frame driver's next tick.
+        crossThreadState.withLock { $0.pendingCursorStyle = newStyle }
+        frameSignal.requestViewUpdate()
     }
     /**
      * Opacity of the terminal's default background, in the 0...1 range (values are clamped).
@@ -4157,13 +4153,18 @@ extension TerminalView: UIAccessibilityReadingContent {
         terminal.terminalLock.preconditionLocked()
         var endingLine = lineNumber
         while (endingLine < terminal.buffer.lines.count - 1) {
-            let start = Position(col: 0, row: endingLine)
-            let end = Position(col: terminal.buffer.lines[endingLine].count, row: endingLine)
-            let text =  terminal.getDisplayText(start: start, end: end)
-            if (text.count != terminal.buffer.lines[endingLine].count || text.last != " ")
-            && !terminal.buffer.lines[endingLine + 1].isWrapped {
-                // this line is incomplete. We stop here.
-                break
+            // A row that wraps onto the next continues whatever its text, so
+            // read the text only where the line could end: reading every row
+            // of a line wrapped over thousands of them made each VoiceOver
+            // query of it slow.
+            if !terminal.buffer.lines[endingLine + 1].isWrapped {
+                let start = Position(col: 0, row: endingLine)
+                let end = Position(col: terminal.buffer.lines[endingLine].count, row: endingLine)
+                let text =  terminal.getDisplayText(start: start, end: end)
+                if text.count != terminal.buffer.lines[endingLine].count || text.last != " " {
+                    // this line is incomplete. We stop here.
+                    break
+                }
             }
             endingLine += 1
         }
